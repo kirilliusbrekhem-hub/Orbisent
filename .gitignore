@@ -1,0 +1,34 @@
+# Datasets downloaded by notebooks
+data/
+*.txt.gz
+*.csv
+*.parquet
+
+# Checkpoints and model weights
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+*.bin
+*.safetensors
+*.onnx
+
+# Secrets
+.env
+.env.*
+*.key
+*.pem
+secrets/
+
+# Python / Jupyter
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.venv/
+venv/
+
+# OS / editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
