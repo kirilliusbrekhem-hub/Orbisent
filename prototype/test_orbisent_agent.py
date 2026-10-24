@@ -1,4 +1,4 @@
-"""Tests for Orbisent Prototype 0.2 (standard library only).
+"""Tests for the Orbisent prototype (0.2 behaviour plus 0.3 step execution; standard library only).
 
 Run from the repository root:
     python3 -m unittest discover -s prototype -v
@@ -12,6 +12,7 @@ from pathlib import Path
 from unittest import mock
 
 import orbisent_agent as agent
+from engine import COMPLETED, FAILED, SKIPPED
 
 PREPARE = agent.TASK_TYPES["prepare_project"]
 CHECKLIST = agent.TASK_TYPES["create_launch_checklist"]
@@ -291,6 +292,113 @@ class SafetyTest(TempDirTest):
         self.assertEqual(completed, [])
         self.assertEqual(len(errors), 1)
         self.assertIn("Could not create folder", errors[0])
+
+
+class StepExecutionTest(TempDirTest):
+    """Prototype 0.3: the CLI runs the task as ordered, verified steps."""
+
+    def run_prepare(self, *extra, answers=("y",)):
+        return run_cli(["Prepare my project folder", "--name", "demo", "--base-dir", str(self.base), *extra],
+                       answers)
+
+    def test_every_task_has_one_plan_sentence_per_file(self):
+        for task in agent.TASK_TYPES.values():
+            with self.subTest(task=task.identifier):
+                self.assertEqual(len(task.plan), len(task.files))
+                steps = agent.build_steps(task, "Goal", self.base / "p", "p")
+                self.assertEqual(len(steps), 1 + len(task.files))
+
+    def test_mismatched_plan_is_rejected(self):
+        broken = agent.TaskType("broken", "Broken", ("x",), ("one", "two"), PREPARE.files[:1])
+        with self.assertRaises(ValueError):
+            agent.build_steps(broken, "Goal", self.base / "p", "p")
+
+    def test_building_the_plan_touches_nothing(self):
+        agent.build_steps(PREPARE, "Goal", self.base / "p", "p")
+        self.assertEqual(self.all_files(), [])
+
+    def test_plan_shows_every_step_with_its_expected_outcome(self):
+        code, out = self.run_prepare(answers=("n",))
+        self.assertEqual(code, agent.EXIT_INCOMPLETE)
+        plan = out[out.index("Plan:"):out.index("Proceed with this plan?")]
+        self.assertEqual(plan.count("Expected:"), 4)
+        self.assertIn("not by an AI", plan)
+        self.assertIn("at least 5 checkbox items", plan)
+        self.assertIn("at least 5 numbered steps", plan)
+        self.assertEqual(self.all_files(), [])
+
+    def test_successful_chain_reports_every_step_completed(self):
+        code, out = self.run_prepare()
+        self.assertEqual(code, agent.EXIT_SUCCESS)
+        self.assertEqual(out.count("[completed]"), 4)
+        self.assertIn("Steps: 4 completed", out)
+        self.assertIn("SUCCESS", out)
+
+    def test_repeated_run_is_all_skipped_and_verified(self):
+        self.run_prepare()
+        code, out = self.run_prepare()
+        self.assertEqual(code, agent.EXIT_SUCCESS)
+        self.assertIn("Steps: 4 skipped", out)
+        self.assertIn("SUCCESS", out)
+
+    def test_existing_bad_file_fails_verification_and_stops(self):
+        project = self.base / "demo"
+        project.mkdir()
+        (project / "TASKS.md").write_text("hello", encoding="utf-8")
+
+        code, out = self.run_prepare()
+
+        self.assertEqual(code, agent.EXIT_INCOMPLETE)
+        self.assertNotIn("SUCCESS", out)
+        self.assertIn("[failed] Write TASKS.md", out)
+        self.assertIn("Problem: Unexpected content", out)
+        self.assertIn("Not run: step 3 failed.", out)
+        self.assertIn("INCOMPLETE: step 3 failed", out)
+        self.assertEqual((project / "TASKS.md").read_text(encoding="utf-8"), "hello")  # Not overwritten.
+        self.assertTrue((project / "README.md").is_file())  # Step 2 ran before the failure.
+        self.assertFalse((project / "LAUNCH_PLAN.md").exists())  # Step 4 never ran.
+
+    def test_execution_failure_stops_later_steps(self):
+        real_open = open
+
+        def failing_open(path, *args, **kwargs):
+            if Path(path).name == "TASKS.md":
+                raise PermissionError("Permission denied")
+            return real_open(path, *args, **kwargs)
+
+        with mock.patch("builtins.open", side_effect=failing_open):
+            code, out = self.run_prepare()
+
+        self.assertEqual(code, agent.EXIT_INCOMPLETE)
+        self.assertIn("Problem: Could not create", out)
+        self.assertIn("Permission denied", out)
+        self.assertIn("Steps: 2 completed, 1 skipped, 1 failed", out)
+        self.assertEqual(self.all_files(), ["demo", "demo/README.md"])
+
+    def test_step_statuses_after_a_run(self):
+        project = self.base / "demo"
+        steps = agent.build_steps(PREPARE, "Goal", project, "demo")
+        project.mkdir()
+        (project / "README.md").write_text("# Mine\n", encoding="utf-8")  # Exists but fails the README checks.
+        self.assertFalse(agent.run_steps(steps))
+        self.assertEqual([s.status for s in steps], [SKIPPED, FAILED, SKIPPED, SKIPPED])
+        self.assertEqual((project / "README.md").read_text(encoding="utf-8"), "# Mine\n")
+
+    def test_cancel_with_existing_files_changes_nothing(self):
+        project = self.base / "demo"
+        project.mkdir()
+        (project / "notes.txt").write_text("keep", encoding="utf-8")
+        code, out = self.run_prepare(answers=("n",))
+        self.assertEqual(code, agent.EXIT_INCOMPLETE)
+        self.assertNotIn("=== Orbisent report ===", out)
+        self.assertEqual(self.all_files(), ["demo", "demo/notes.txt"])
+        self.assertEqual((project / "notes.txt").read_text(encoding="utf-8"), "keep")
+
+    def test_completed_steps_are_verified_by_content(self):
+        steps = agent.build_steps(CHECKLIST, "Goal", self.base / "c", "c")
+        self.assertTrue(agent.run_steps(steps))
+        self.assertEqual([s.status for s in steps], [COMPLETED, COMPLETED])
+        self.assertIn("at least 12 checkbox items", steps[1].expected)
 
 
 if __name__ == "__main__":
