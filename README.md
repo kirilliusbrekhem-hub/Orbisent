@@ -5,11 +5,13 @@ Orbisent is an early-stage project to build a personal AI agent that turns a per
 executed and **verified** results, and reports honestly what worked and what didn't.
 The long-term vision is in [`VISION.md`](VISION.md); the first prototype's scope is in [`Prototype.md`](Prototype.md).
 
-## Current state: Prototype 0.2
+## Current state: Prototype 0.3
 
 [`prototype/`](prototype/) contains a small command-line program, using only the Python standard library.
-It takes a goal, picks a task type from fixed keywords, shows a plan and asks for permission.
-Then it creates the files, verifies them and prints a report. It never overwrites or deletes files.
+It takes a goal and picks a task type from fixed keywords. It turns the task into ordered steps, each with an
+expected outcome, shows that plan and asks for permission. Then it runs the steps one at a time, verifies each
+one, stops at the first failure and reports every step's status. It never overwrites or deletes files.
+The steps are deterministic rules; they are not planned by an AI.
 
 | Task type | Creates |
 | --- | --- |
@@ -31,5 +33,6 @@ It is separate from the prototype.
 ## Limitations
 
 Orbisent is **not** a fully autonomous AI agent yet. The prototype doesn't use an AI model.
-It recognises goals by keywords, supports two task types with fixed templates, and only creates local files.
+It recognises goals by keywords and runs fixed steps for two task types with fixed templates.
+It only creates local folders and files, and it doesn't retry or repair failed steps.
 It has no memory, integrations, voice control or scheduling.
