@@ -212,34 +212,70 @@ class ModelProvider(Protocol):
 ### 4.3 Goal understanding
 
 **Responsibility:** turn free text into a structured `GoalSpec`, or say clearly that it can't.
+**Implemented** in `orbisent/types.py` and `orbisent/understanding/interpreters.py` (Phase 1, part 1).
 
 ```python
-@dataclass
+@dataclass(frozen=True)
 class GoalSpec:
     text: str                       # Cleaned goal text (0.2 clean_goal).
-    task_type: str | None           # e.g. "prepare_project"
-    parameters: dict                # e.g. {"project_name": "bakery"}
-    confidence: float               # 1.0 for an exact rule match.
-    source: str                     # "rules" | "explicit" | "model:<provider>"
-    ambiguities: list[str]          # Why it couldn't decide, shown to the user.
+    task_type: str | None           # e.g. "prepare_project"; None means "needs clarification".
+    source: str                     # "explicit" | "rules" | "chain"; later "model:<provider>"
+    confidence: float = 0.0         # 1.0 for an exact rule or explicit match; 0.0 when unclear.
+    parameters: FrozenMap = FrozenMap()   # e.g. {"project_name": "bakery"}; values: str, int, bool, None.
+    ambiguities: tuple[str, ...] = ()     # Why it couldn't decide, shown to the user.
+    candidates: tuple[str, ...] = ()      # Task types that matched, when more than one did.
 
     @property
     def needs_clarification(self) -> bool:
         return self.task_type is None
 
+    # Constructors: GoalSpec.decided(text, task_type, source, ...) and GoalSpec.unclear(text, source, reasons, ...)
+
 class GoalInterpreter(Protocol):
-    def interpret(self, request: Request) -> GoalSpec: ...
+    def interpret(self, request: Request) -> GoalSpec | None: ...
 ```
+
+**Types.** `GoalSpec` and `Request` are frozen dataclasses with tuple sequences. Their mappings
+(`GoalSpec.parameters`, `Request.options`) are `FrozenMap`s: immutable copies whose values must be exactly `str`,
+`int`, `bool` or `None` (no floats, no subclasses). Both types can be compared, hashed, copied, deep-copied, pickled
+and passed to `dataclasses.asdict()`.
+
+A `GoalSpec` has exactly two valid shapes, and any other combination raises:
+- **decided:** `task_type` set, confidence above 0, no ambiguities or candidates;
+- **unclear:** `task_type=None`, confidence 0, at least one reason in `ambiguities`.
+
+**The interpreter contract.** An interpreter returns one of:
+- `None`: "this doesn't apply; ask the next interpreter";
+- a decided `GoalSpec`;
+- an unclear `GoalSpec`: "I can't decide, and nobody should guess". **This stops the chain.**
 
 Implementations, tried in order by a `ChainedInterpreter`:
 
 1. **`ExplicitInterpreter`**: `--task` given → use it (0.2 rule: explicit beats inferred).
+   - It returns `None` when there's no `--task`.
+   - An unknown task type gives an unclear result, so it **never falls through** to the keyword rules.
 2. **`RuleInterpreter`**: the 0.2 `classify_goal()` keyword matcher, unchanged in behaviour.
+   - Exactly one match decides.
+   - No match, or several matches (listed in `candidates`), gives an unclear result.
 3. **`ModelInterpreter`** (built in Phase 3, off by default): asks the model to pick **one of the registered
    task types or none**, with parameters. Its answer is accepted only if the task type exists, the parameters
    validate, and the confidence is above a threshold. Otherwise it's treated as ambiguous.
+   - Because an unclear rule result stops the chain, Phase 3 must decide where the model interpreter sits and
+     whether `RuleInterpreter` passes (`None`) when it's undecided. A model must never override a decisive result.
 
-If no step decides, the user gets the 0.2 behaviour: an explanation, the list of task types and a
+**Rules shared by all interpreters:**
+- **Empty goal:** every interpreter refuses an empty goal (after whitespace clean-up) with the same reason,
+  "the goal must not be empty", whether it is used alone or in a chain. The chain checks first, so no
+  interpreter runs on an empty goal.
+- **Strict configuration:** each interpreter checks its configuration when it's built and keeps it read-only.
+  - task type names must be non-empty, exact strings, with no duplicates;
+  - keyword tables must be mappings of task types to non-empty sequences of lowercase, single-spaced ASCII
+    keywords;
+  - the same keyword can't appear twice or for two task types;
+  - a chain only accepts objects with an `interpret()` method.
+- **Parity:** `tests/test_understanding.py` compares the default chain with Prototype 0.3 on a fixed corpus of goals.
+
+If no interpreter decides, the user gets the 0.2 behaviour: an explanation, the list of task types and a
 `--task` example. **Nothing is created on a guess.**
 
 ### 4.4 Intelligent task planning
@@ -713,8 +749,8 @@ metadata described in §4.8.6 is written to the audit log.
 
 | Type | Main fields | Produced by → used by |
 | --- | --- | --- |
-| `Request` | `text`, `explicit_task`, `options` | CLI → Core |
-| `GoalSpec` | `text`, `task_type`, `parameters`, `confidence`, `source`, `ambiguities` | Interpreter → Planner |
+| `Request` | `text`, `explicit_task`, `options` (`FrozenMap`); frozen | CLI → Core |
+| `GoalSpec` | `text`, `task_type`, `source`, `confidence`, `parameters` (`FrozenMap`), `ambiguities`, `candidates`; frozen | Interpreter → Planner |
 | `Plan` / `PlanStep` | steps (`tool`, `args`, `description`, `expected`, `checks`), `acceptance`, `source`; frozen, sequences are tuples | Planner → Validator → Approver |
 | `CheckSpec` | `kind`, `params` (data only, no code) | Planner → Validator → Verifier |
 | `ApprovedPlan` | `canonical_bytes`, `plan_hash`, `run_id`, `approved_by`, per-step policy decisions; frozen | Approver → Engine, Verifier, audit log |

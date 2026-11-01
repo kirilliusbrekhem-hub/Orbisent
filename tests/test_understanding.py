@@ -15,6 +15,7 @@ from unittest import mock
 from orbisent.types import GoalSpec, Request
 from orbisent.understanding import (
     DEFAULT_KEYWORDS,
+    EMPTY_GOAL_REASON,
     ChainedInterpreter,
     ExplicitInterpreter,
     RuleInterpreter,
@@ -190,7 +191,7 @@ class RuleInterpreterTest(unittest.TestCase):
                 RuleInterpreter({"t": (bad,)})
         with self.assertRaises(TypeError):
             RuleInterpreter({"t": "checklist"})  # A string, not a sequence of strings.
-        with self.assertRaises(ValueError):
+        with self.assertRaises(TypeError):  # Not a string at all: a type error, still rejected.
             RuleInterpreter({"t": (None,)})
 
     def test_keyword_table_is_copied(self):
@@ -272,6 +273,129 @@ class DeterminismAndIsolationTest(unittest.TestCase):
                 interpreter.interpret(Request(goal))
                 interpreter.interpret(Request(goal, "prepare_project"))
         blocked.assert_not_called()
+
+
+class InitValidationTest(unittest.TestCase):
+    """N2: interpreters check their configuration when built and keep it read-only."""
+
+    def test_explicit_rejects_bad_task_types(self):
+        type_errors = ["prepare_project", b"prepare_project", None, 3, [None], [1], ["ok", None],
+                       {"prepare_project"}]  # A set has no order, so it's rejected too.
+        for value in type_errors:
+            with self.subTest(value=value), self.assertRaises(TypeError):
+                ExplicitInterpreter(value)
+        for value in ([], (), [""], ["a", "a"]):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                ExplicitInterpreter(value)
+
+    def test_explicit_task_types_are_read_only(self):
+        source = ["a", "b"]
+        interpreter = ExplicitInterpreter(source)
+        source.append("c")
+        self.assertEqual(interpreter.task_types, ("a", "b"))
+        with self.assertRaises(AttributeError):
+            interpreter.task_types = ("x",)
+
+    def test_rule_rejects_bad_tables(self):
+        type_errors = [["not", "a", "mapping"], "checklist", None,
+                       {1: ("word",)},                  # Task type name isn't a string.
+                       {"t": "word"},                   # A single string instead of a sequence.
+                       {"t": {"word"}},                 # A set: no order.
+                       {"t": (None,)}, {"t": (b"word",)}]
+        for value in type_errors:
+            with self.subTest(value=value), self.assertRaises(TypeError):
+                RuleInterpreter(value)
+        value_errors = [{},                             # Nothing to classify.
+                        {"": ("word",)},                # Empty task type name.
+                        {"t": ()},                      # A task type that could never be chosen.
+                        {"t": ("word", "word")},        # Duplicate keyword.
+                        {"a": ("word",), "b": ("word",)},  # Same keyword for two task types: always ambiguous.
+                        {"t": ("Word",)}]
+        for value in value_errors:
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                RuleInterpreter(value)
+
+    def test_rule_keywords_are_read_only(self):
+        rules = RuleInterpreter()
+        with self.assertRaises(TypeError):
+            rules.keywords["x"] = ("y",)
+        with self.assertRaises(AttributeError):
+            rules.keywords = {}
+        with self.assertRaises(TypeError):
+            DEFAULT_KEYWORDS["x"] = ("y",)
+        self.assertEqual(list(rules.keywords), ["prepare_project", "create_launch_checklist"])
+
+    def test_chain_rejects_bad_interpreters(self):
+        for value in ("not a list", None, [object()], [Spy(None), "rules"]):
+            with self.subTest(value=value), self.assertRaises(TypeError):
+                ChainedInterpreter(value)
+        chain = ChainedInterpreter([Spy(None)])
+        with self.assertRaises(AttributeError):
+            chain.interpreters = ()
+
+    def test_default_configuration_is_valid(self):
+        default_interpreter()  # Must not raise.
+        ExplicitInterpreter()
+        RuleInterpreter()
+
+
+class EmptyGoalTest(unittest.TestCase):
+    """N3: every interpreter refuses an empty goal the same way, alone or in a chain."""
+
+    EMPTY = ("", " ", "  \n\t ")
+
+    def assert_refused(self, spec, source):
+        self.assertTrue(spec.needs_clarification)
+        self.assertEqual((spec.text, spec.source, spec.ambiguities), ("", source, (EMPTY_GOAL_REASON,)))
+
+    def test_explicit_alone(self):
+        for text in self.EMPTY:
+            with self.subTest(text=text):
+                self.assert_refused(ExplicitInterpreter().interpret(Request(text, "prepare_project")), "explicit")
+                # An unknown task with an empty goal still reports the empty goal first, like the chain.
+                self.assert_refused(ExplicitInterpreter().interpret(Request(text, "nope")), "explicit")
+                # Without --task, the explicit interpreter doesn't apply at all.
+                self.assertIsNone(ExplicitInterpreter().interpret(Request(text)))
+
+    def test_rules_alone(self):
+        for text in self.EMPTY:
+            with self.subTest(text=text):
+                self.assert_refused(RuleInterpreter().interpret(Request(text)), "rules")
+
+    def test_chain(self):
+        for text in self.EMPTY:
+            for task in (None, "prepare_project", "nope"):
+                with self.subTest(text=text, task=task):
+                    self.assert_refused(default_interpreter().interpret(Request(text, task)), "chain")
+
+    def test_same_wording_everywhere(self):
+        reasons = {
+            ExplicitInterpreter().interpret(Request("", "prepare_project")).ambiguities,
+            RuleInterpreter().interpret(Request("")).ambiguities,
+            ChainedInterpreter([]).interpret(Request("")).ambiguities,
+        }
+        self.assertEqual(reasons, {("the goal must not be empty",)})
+
+
+class DiscoveryTest(unittest.TestCase):
+    """N5: plain `python3 -m unittest` from the repository root finds these tests."""
+
+    def test_root_discovery_finds_the_tests_package(self):
+        root = Path(__file__).resolve().parent.parent
+        self.assertTrue((root / "tests" / "__init__.py").is_file())
+        suite = unittest.defaultTestLoader.discover(str(root), top_level_dir=str(root))
+
+        def ids(test):
+            if isinstance(test, unittest.TestSuite):
+                for child in test:
+                    yield from ids(child)
+            else:
+                yield test.id()
+
+        found = list(ids(suite))
+        self.assertTrue(any(i.startswith("tests.test_types.") for i in found))
+        self.assertTrue(any(i.startswith("tests.test_understanding.") for i in found))
+        self.assertFalse([i for i in found if "_FailedTest" in i or "ModuleImportFailure" in i])
 
 
 if __name__ == "__main__":
